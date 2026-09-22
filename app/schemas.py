@@ -536,3 +536,69 @@ class TaskStatus(BaseModel):
         None, description="本次配额预留及剩余次数（仅创建时声明 use_quota 的任务返回）"
     )
     result: Optional[TaskResult] = None
+
+
+# --------------------------------------------------------------------------- #
+# 防篡改审计链（GET /api/tasks/{task_id}/audit）
+# --------------------------------------------------------------------------- #
+class TaskAuditEvent(BaseModel):
+    """审计链上的单条事件（只追加，不可修改）。"""
+
+    seq: int = Field(..., ge=1, description="任务内事件序号，从 1 起连续递增")
+    time: str = Field(..., description="事件时间（UTC ISO 8601）")
+    type: str = Field(
+        ...,
+        description=(
+            "事件类型：task_created / task_started / task_completed /"
+            " task_failed / quota_settled"
+        ),
+    )
+    payload: Dict[str, Any] = Field(
+        ..., description="最小业务载荷（规范化 JSON，哈希链直接覆盖其文本）"
+    )
+    prev_hash: str = Field(
+        ..., description="前一事件哈希；首事件为创世哈希 SHA256('')"
+    )
+    hash: str = Field(
+        ...,
+        description=(
+            "本事件哈希：SHA256(prev_hash + 规范化JSON{seq,time,type,payload})"
+        ),
+    )
+
+
+class AuditBreakpoint(BaseModel):
+    """审计链校验发现的首个断点（链完整时该字段为 null）。"""
+
+    seq: int = Field(..., description="断点所在事件序号（empty_chain 时为 0）")
+    code: str = Field(
+        ...,
+        description=(
+            "异常类别：empty_chain / seq_gap / prev_hash_mismatch /"
+            " payload_invalid_json / payload_not_canonical / hash_mismatch"
+        ),
+    )
+    detail: str = Field(..., description="异常的可读说明")
+    expected: Optional[Any] = Field(None, description="期望值（序号/哈希，视类别而定）")
+    actual: Optional[Any] = Field(None, description="实际值（序号/哈希，视类别而定）")
+
+
+class TaskAuditOut(BaseModel):
+    """任务审计链：事件序列 + 独立重放校验结论。"""
+
+    task_id: int
+    valid: bool = Field(
+        ...,
+        description=(
+            "按存储事件独立重放 SHA-256 链的校验结论；true 为完整无误，"
+            "false 时以 first_breakpoint 给出首个断点"
+        ),
+    )
+    event_count: int = Field(..., description="事件总数")
+    last_hash: Optional[str] = Field(
+        None, description="链尾事件哈希；链不完整或无事件时为 null"
+    )
+    first_breakpoint: Optional[AuditBreakpoint] = Field(
+        None, description="首个断点；valid=true 时为 null"
+    )
+    events: List[TaskAuditEvent] = Field(..., description="按序号排列的事件链")

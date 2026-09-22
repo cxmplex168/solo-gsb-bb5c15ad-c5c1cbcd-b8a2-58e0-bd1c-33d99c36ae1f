@@ -14,7 +14,7 @@ _semaphore = threading.Semaphore(1)
 
 def _run(task_id: int) -> None:
     with _semaphore:
-        database.update_status(task_id, "running")
+        database.mark_task_running(task_id)
         row = database.get_task(task_id)
         req = json.loads(row["request"])
         try:

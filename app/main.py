@@ -9,14 +9,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import asynccontextmanager
 from pydantic import ValidationError
 
-from . import database
+from . import audit, database
 from .schemas import (
     OVERRIDABLE_FIELDS,
+    AuditBreakpoint,
     ExamTaskIn,
     QuotaOut,
     QuotaReservationOut,
     QuotaSetIn,
     ReviseTaskIn,
+    TaskAuditEvent,
+    TaskAuditOut,
     TaskCreated,
     TaskQuotaOut,
     TaskResult,
@@ -44,7 +47,7 @@ app = FastAPI(
         "可版本化、创建后不可变的组卷模板，"
         "以及按题号扣减的题目曝光配额"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -353,4 +356,77 @@ def get_task(task_id: int) -> TaskStatus:
         template_version=template_version,
         quota=quota_info,
         result=result,
+    )
+
+
+@app.get(
+    "/api/tasks/{task_id}/audit",
+    response_model=TaskAuditOut,
+)
+def get_task_audit(task_id: int) -> TaskAuditOut:
+    """查询任务的防篡改审计事件链，并给出独立重放的校验结论。
+
+    事件按序号返回，哈希规则：``hash_n = SHA256(prev_hash + 规范化JSON{
+    seq,time,type,payload})``，首事件前驱为 ``SHA256("")``。服务端按存储事件
+    **逐条独立重算**：序号不连续、前驱哈希不一致或内容摘要失配时，
+    ``valid=false`` 且 ``first_breakpoint`` 指向**首个**断点（断点之后的事件
+    仍原样列出，但不据此判定通过）。
+    """
+    row = database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    rows = database.list_audit_events(task_id)
+
+    # 载荷被改成非法 JSON 时不抛 500：事件仍原样列出，真正的结论以断点为准
+    def _safe_payload(text: str) -> Dict[str, Any]:
+        try:
+            value = json.loads(text)
+        except (ValueError, TypeError):
+            return {"_raw": text, "_invalid_json": True}
+        if not isinstance(value, dict):
+            return {"_raw": value, "_non_object_payload": True}
+        return value
+
+    events = [
+        TaskAuditEvent(
+            seq=int(r["seq"]),
+            time=r["event_time"],
+            type=r["event_type"],
+            payload=_safe_payload(r["payload"]),
+            prev_hash=r["prev_hash"],
+            hash=r["hash"],
+        )
+        for r in rows
+    ]
+    breakpoint_info = audit.verify_chain(
+        [
+            {
+                "seq": r["seq"],
+                "event_time": r["event_time"],
+                "event_type": r["event_type"],
+                "payload": r["payload"],
+                "prev_hash": r["prev_hash"],
+                "hash": r["hash"],
+            }
+            for r in rows
+        ]
+    )
+
+    if breakpoint_info is None:
+        return TaskAuditOut(
+            task_id=task_id,
+            valid=True,
+            event_count=len(events),
+            last_hash=events[-1].hash,
+            first_breakpoint=None,
+            events=events,
+        )
+    return TaskAuditOut(
+        task_id=task_id,
+        valid=False,
+        event_count=len(events),
+        last_hash=None,
+        first_breakpoint=AuditBreakpoint(**breakpoint_info),
+        events=events,
     )
