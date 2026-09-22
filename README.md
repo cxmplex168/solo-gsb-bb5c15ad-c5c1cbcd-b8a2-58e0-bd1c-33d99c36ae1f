@@ -12,6 +12,8 @@
 
 另提供**题目曝光配额**模块（`PUT /api/quotas`）：按题号设置可用次数；创建任务时声明 `use_quota: true` 后，任务完成可行组卷即在 **SQLite 事务中按题号原子扣减**——并发任务串行化校验，任一题余额不足则整组不扣减、任务返回 `quota_exceeded` 及缺额明细；失败或无解任务不消耗配额，详见下文[题目曝光配额](#题目曝光配额use_quota)。
 
+每个异步任务还附带一条**防篡改审计链**（`GET /api/tasks/{task_id}/audit`）：任务创建、开始、完成或失败、配额结算均在**对应业务写入的同一 SQLite 事务内**追加哈希链接事件（规范化 JSON + SHA-256，含前驱哈希）；接口重放整条链并与任务/配额业务表交叉校验，发现序号、前驱哈希或内容摘要异常时返回**首个断点**，绝不伪报通过，详见下文[防篡改审计链](#防篡改审计链)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -22,7 +24,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas 与 quota_reservations 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations 与 task_audit_events 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -45,6 +47,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id`；`use_quota: true` 时启用题目曝光配额 |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
+| `GET`  | `/api/tasks/{task_id}/audit` | 查询任务的**防篡改审计事件链**及重放校验结论（首个断点） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果（启用配额的任务附本次预留及剩余次数） |
 | `POST` | `/api/templates` | 创建组卷模板（不可变）；带 `base_template_id` 时创建该谱系的新版本 |
 | `GET`  | `/api/templates/{template_id}` | 查询模板的冻结配置与版本信息 |
@@ -570,6 +573,128 @@ curl -X POST http://localhost:8000/api/tasks \
 ```
 
 补足配额（重新 `PUT /api/quotas`）后重新提交任务即可。
+
+## 防篡改审计链
+
+每个异步组卷任务都附带一条**只追加、不可变**的哈希链接审计链，落库于 `task_audit_events` 表。任务生命周期与配额结算的每个关键动作都在**对应业务写入所在的现有 SQLite 事务内**追加事件——业务改动与审计事件要么同时提交、要么同时回滚：
+
+| 事件 `type` | 追加时机（同事务的业务写入） | 最小业务载荷 `payload` |
+| --- | --- | --- |
+| `created` | 插入 `tasks` 行（任务创建，恒为第 1 个事件） | `name`、`seed`、`request_sha256`（冻结请求文本的 SHA-256） |
+| `started` | 状态 `pending → running` | `{"status": "running"}` |
+| `finished` | 结果落库（`feasible` / `infeasible` / `error` / `quota_exceeded`） | `result_status`、`result_sha256`（结果文本的 SHA-256） |
+| `quota_settled` | **配额扣减/判定不扣减**（与扣减结果同一事务原子提交） | `outcome=reserved` 时为逐题 `items`（题号、`reserved` 扣减次数、`remaining` 扣后剩余快照）；`outcome=exceeded` 时为 `shortages` 缺额明细 |
+
+普通任务的链为 `created → started → finished`（3 个事件）；声明 `use_quota` 的任务在 `finished` 后同事务追加 `quota_settled`（4 个事件）；任务尚未开始时只有 `created`。
+
+### 哈希与规范化口径
+
+- 事件序号 `seq`：同一任务内从 **1** 起连续递增；并发下事件追加与业务写入同受进程内互斥锁保护，同任务写入严格连续。
+- 前驱哈希 `prev_hash`：等于链上前一事件的 `hash`；**首事件固定为 64 个 `0`**（创世哈希）。
+- 事件哈希 `hash`：对如下事件体的**规范化 JSON**（UTF-8、对象键按字典序升序、无任何空白字符、非 ASCII 不转义）计算 SHA-256：
+
+  ```
+  {"task_id":…,"seq":…,"type":…,"created_at":…,"payload":{…},"prev_hash":"…"}
+  ```
+
+  事件体不含 `hash` 自身；`created_at` 为事件落库时刻的 UTC ISO 8601 时间（秒级，`Z` 结尾）。载荷中的 `request_sha256` / `result_sha256` 另把完整业务文本钉在链上，使链与 `tasks` 表形成交叉锚定。
+
+### 查询审计链（`GET /api/tasks/{task_id}/audit`）
+
+```bash
+curl http://localhost:8000/api/tasks/21/audit
+```
+
+任务不存在返回 `404`。链完整时 `valid: true`，按序号返回全部事件与链尾锚点 `last_hash`：
+
+```json
+{
+  "task_id": 21,
+  "valid": true,
+  "verified_at": "2026-09-22T12:00:05Z",
+  "events": [
+    {
+      "seq": 1,
+      "type": "created",
+      "created_at": "2026-09-22T12:00:00Z",
+      "payload": {
+        "name": "高三数学月考",
+        "seed": 42,
+        "request_sha256": "57ac592d34ceb4d61403a8a3277b618335d35e71ad691d9d31aec568a…"
+      },
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash": "cf867f54fbf0f295068395de27422de2d6929c97c3057d71e8bd8661302f9c84"
+    },
+    {"seq": 2, "type": "started", "created_at": "2026-09-22T12:00:00Z",
+     "payload": {"status": "running"}, "prev_hash": "cf86…f9c84", "hash": "ed9b…0e802"},
+    {"seq": 3, "type": "finished", "created_at": "2026-09-22T12:00:05Z",
+     "payload": {"result_status": "feasible", "result_sha256": "9a79…b7dd"},
+     "prev_hash": "ed9b…0e802", "hash": "458b…ac846"},
+    {
+      "seq": 4,
+      "type": "quota_settled",
+      "created_at": "2026-09-22T12:00:05Z",
+      "payload": {
+        "outcome": "reserved",
+        "items": [
+          {"question_id": 1, "reserved": 1, "remaining": 1},
+          {"question_id": 2, "reserved": 1, "remaining": 0}
+        ]
+      },
+      "prev_hash": "458b…ac846",
+      "hash": "a301…7f21"
+    }
+  ],
+  "break_point": null,
+  "last_hash": "a301…7f21"
+}
+```
+
+`outcome=exceeded`（配额不足、整组未扣减）时第 4 个事件形如：
+
+```json
+{
+  "seq": 4,
+  "type": "quota_settled",
+  "payload": {
+    "outcome": "exceeded",
+    "shortages": [{"question_id": 2, "required": 1, "available": 0, "shortage": 1}]
+  },
+  "prev_hash": "…",
+  "hash": "…"
+}
+```
+
+### 校验结论与首个断点
+
+接口在每次请求时**重放整条链**，按下列顺序检查，命中第一个异常即停止并在 `break_point` 返回断点（`at_seq` 定位事件序号、`kind` 异常类别、`expected`/`actual` 期望与实际值），同时 `events` 仍返回链上全部记录便于排查：
+
+1. **序号连续性**：空链为 `empty_chain`；事件必须从 `seq=1` 起逐条 +1，断号/跳号返回 `seq_gap`；首事件类型不是 `created` 返回 `unexpected_first_event`；
+2. **前驱哈希**：`prev_hash` 不等于上一事件 `hash`（首事件不等于创世哈希）返回 `prev_hash_mismatch`；
+3. **内容摘要**：按同一规范化口径重算事件体哈希，与存储 `hash` 不符返回 `hash_mismatch`；载荷不是合法 JSON / 非规范化文本返回 `payload_not_json` / `payload_not_canonical`；未知事件类型返回 `unknown_event_type`；
+4. **生命周期**：`created` / `started` / `finished` 各至多一次（重复为 `duplicate_event`），且必须按 `created → started → finished → quota_settled` 的顺序出现（越序或缺前驱为 `event_order`）；
+5. **与业务表交叉比对**：`created` 载荷的 `request_sha256` / `name` / `seed` 与 `tasks` 行不符（`request_digest_mismatch` / `name_mismatch` / `seed_mismatch`）；`finished` 的 `result_sha256` / `result_status` 与 `tasks.result` 不符（`result_digest_mismatch` / `result_status_mismatch`）；`quota_settled` 的逐题预留/缺额与 `quota_reservations`、任务结果不符（`reservations_mismatch` / `shortages_mismatch` / `settlement_outcome_mismatch`）；
+6. **状态完备性**：`running`/`done` 任务缺 `started` 事件、`done` 任务缺 `finished` 事件、声明 `use_quota` 的任务缺 `quota_settled` 事件（分别为 `started_event_missing` / `finished_event_missing` / `quota_settled_event_missing`，此时 `at_seq` 为 `null`，断点位于链尾之后）。
+
+校验在**单一只读事务快照**中读取任务行、事件链与预留明细后重放（不存在跨连接的瞬时不一致），任何一项失败 `valid` 即为 `false`，**不存在“链被改动但仍报告通过”的情况**——即使攻击者重新计算全部事件哈希使链自洽，业务文本摘要的交叉比对也会暴露篡改。例如下例中第 2 个事件的前驱哈希被改动：
+
+```json
+{
+  "task_id": 21,
+  "valid": false,
+  "verified_at": "2026-09-22T12:03:00Z",
+  "events": [ /* …链上全部事件仍原样返回… */ ],
+  "break_point": {
+    "at_seq": 2,
+    "kind": "prev_hash_mismatch",
+    "expected": "cf867f54fbf0f295068395de27422de2d6929c97c3057d71e8bd8661302f9c84",
+    "actual": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "last_hash": "a301…7f21"
+}
+```
+
+> 审计事件表只追加，服务不提供任何修改/删除接口；`last_hash` 可作为外部留存的链顶锚点，与历史响应中的值逐次比对即可发现库被离线改写。
 
 ## 可行结果
 

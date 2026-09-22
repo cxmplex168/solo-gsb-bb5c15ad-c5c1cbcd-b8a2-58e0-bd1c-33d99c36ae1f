@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -12,11 +13,13 @@ from pydantic import ValidationError
 from . import database
 from .schemas import (
     OVERRIDABLE_FIELDS,
+    AuditEventOut,
     ExamTaskIn,
     QuotaOut,
     QuotaReservationOut,
     QuotaSetIn,
     ReviseTaskIn,
+    TaskAuditOut,
     TaskCreated,
     TaskQuotaOut,
     TaskResult,
@@ -44,7 +47,7 @@ app = FastAPI(
         "可版本化、创建后不可变的组卷模板，"
         "以及按题号扣减的题目曝光配额"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -353,4 +356,53 @@ def get_task(task_id: int) -> TaskStatus:
         template_version=template_version,
         quota=quota_info,
         result=result,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 防篡改审计链：重放哈希链并与业务表交叉校验，返回事件链与首个断点
+# --------------------------------------------------------------------------- #
+@app.get("/api/tasks/{task_id}/audit", response_model=TaskAuditOut)
+def get_task_audit(task_id: int) -> TaskAuditOut:
+    """查询任务的防篡改审计事件链及校验结论。
+
+    返回按序号排列的全部事件（created / started / finished / quota_settled）
+    与逐条重放 SHA-256 哈希链、交叉比对任务/配额业务表后的校验结论：
+
+    - ``valid=true``：序号从 1 连续、前驱哈希逐环咬合、事件内容摘要全部重算
+      一致，且请求/结果摘要、配额预留与业务表实际内容相符；
+    - ``valid=false``：``break_point`` 给出**首个**断点的序号、类别与
+      期望/实际值（不伪报通过），``events`` 仍返回链上全部记录以便定位。
+
+    事件哈希口径：对 ``{task_id, seq, type, created_at, payload, prev_hash}``
+    的规范化 JSON（UTF-8、键升序、无空白、不转义非 ASCII）计算 SHA-256；
+    首事件前驱为 64 个 0。
+    """
+    # 任务行、事件链、预留明细在单一只读事务快照中读取并校验，避免跨连接
+    # 瞬时不一致造成误报；快照内查无任务即 404
+    snapshot = database.get_audit_snapshot(task_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _, event_rows, break_point = snapshot
+    events = [
+        AuditEventOut(
+            seq=r["seq"],
+            type=r["event_type"],
+            created_at=r["created_at"],
+            payload=json.loads(r["payload"]),
+            prev_hash=r["prev_hash"],
+            hash=r["hash"],
+        )
+        for r in event_rows
+    ]
+    return TaskAuditOut(
+        task_id=task_id,
+        valid=break_point is None,
+        verified_at=datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        events=events,
+        break_point=break_point,
+        last_hash=event_rows[-1]["hash"] if event_rows else None,
     )

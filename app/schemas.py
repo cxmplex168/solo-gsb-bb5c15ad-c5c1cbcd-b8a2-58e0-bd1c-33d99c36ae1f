@@ -517,6 +517,72 @@ class TaskCreated(BaseModel):
     status: str
 
 
+# --------------------------------------------------------------------------- #
+# 防篡改审计链（GET /api/tasks/{task_id}/audit）
+# --------------------------------------------------------------------------- #
+class AuditEventOut(BaseModel):
+    """审计链上的单个事件（哈希计算口径见 README“防篡改审计链”）。"""
+
+    seq: int = Field(..., description="同任务内从 1 起连续递增的事件序号")
+    type: str = Field(
+        ..., description="事件类型：created / started / finished / quota_settled"
+    )
+    created_at: str = Field(..., description="事件时间（UTC ISO 8601，秒级，Z 结尾）")
+    payload: Dict[str, Any] = Field(
+        ..., description="最小业务载荷（规范化 JSON 对象，内容摘要进入事件哈希）"
+    )
+    prev_hash: str = Field(
+        ..., description="前一事件哈希；首事件为 64 个 0（创世哈希）"
+    )
+    hash: str = Field(
+        ...,
+        description=(
+            "本事件哈希：对 {task_id, seq, type, created_at, payload, prev_hash}"
+            " 的规范化 JSON（UTF-8、键升序、无空白）计算的 SHA-256"
+        ),
+    )
+
+
+class AuditBreakOut(BaseModel):
+    """首个断点定位（valid=false 时必返；不伪报通过）。"""
+
+    at_seq: Optional[int] = Field(
+        None, description="断点所在事件序号；空链或链尾缺失类问题时为 null"
+    )
+    kind: str = Field(
+        ...,
+        description=(
+            "异常类别：empty_chain / seq_gap / unexpected_first_event / "
+            "prev_hash_mismatch / hash_mismatch / payload_not_json / "
+            "payload_not_canonical / request_digest_mismatch / "
+            "result_digest_mismatch / quota_settled_event_missing 等"
+        ),
+    )
+    expected: Optional[Any] = None
+    actual: Optional[Any] = None
+
+
+class TaskAuditOut(BaseModel):
+    """任务审计链及重放校验结论。"""
+
+    task_id: int
+    valid: bool = Field(
+        ...,
+        description="链是否完整：序号连续、前驱哈希与逐事件哈希全部重算通过，"
+        "且与任务/配额业务表交叉比对一致；发现任何异常即为 false",
+    )
+    verified_at: str = Field(..., description="校验执行时间（UTC ISO 8601，Z 结尾）")
+    events: List[AuditEventOut] = Field(
+        ..., description="全部事件（按 seq 升序；校验失败时同样返回，便于定位）"
+    )
+    break_point: Optional[AuditBreakOut] = Field(
+        None, description="首个断点（valid=true 时为 null）"
+    )
+    last_hash: Optional[str] = Field(
+        None, description="链尾事件哈希（空链时为 null），可作为外部留存的链顶锚点"
+    )
+
+
 class TaskStatus(BaseModel):
     task_id: int
     status: str
